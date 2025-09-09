@@ -151,6 +151,8 @@ namespace tiny_redis {
         static constexpr size_t kZsetVectorThreshold = 128; // 使用ZSET的阈值
     };
 
+    extern KeyValueStore g_store;  // 单例
+
 } // namespace tiny_redis
 
 #endif
