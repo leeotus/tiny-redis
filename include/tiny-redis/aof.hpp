@@ -35,7 +35,7 @@ namespace tiny_redis {
         bool appendCommand(const std::vector<std::string> &parts);
 
         // @brief 往AOF记录原生的RESP协议命令
-        bool appendRow(const std::string &raw_resp);
+        bool appendRaw(const std::string &raw_resp);
 
         bool isEnabled() const { return opts_.enabled; }
         AofMode mode() const { return opts_.mode; }

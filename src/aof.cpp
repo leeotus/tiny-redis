@@ -646,7 +646,7 @@ namespace tiny_redis {
         return true;
     }
 
-    bool AofLogger::appendRow(const std::string &raw_resp)
+    bool AofLogger::appendRaw(const std::string &raw_resp)
     {
         if(!opts_.enabled || fd_ < 0) {
             return true;
