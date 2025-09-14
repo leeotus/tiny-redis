@@ -2,7 +2,7 @@
 #define __TINY_REDIS_RDB_HPP__
 
 #include <string>
-#include "config.hpp"
+#include "tiny_redis/config.hpp"
 
 namespace tiny_redis {
 

@@ -1,6 +1,6 @@
-#include "aof.hpp"
-#include "log.hpp"
-#include "kv.hpp"
+#include "tiny_redis/aof.hpp"
+#include "tiny_redis/log.hpp"
+#include "tiny_redis/kv.hpp"
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -610,38 +610,31 @@ namespace tiny_redis {
 
     bool AofLogger::appendCommand(const std::vector<std::string> &parts)
     {
-        if(!opts_.enabled || fd_ < 0) {
+        if (!opts_.enabled || fd_ < 0)
             return true;
-        }
         std::string line = toRespArray(parts);
         std::string line_copy;
         bool need_incr = rewriting_.load();
-        if(need_incr) {
-            /**
-             * @note 增量缓冲用于在某个长时间操作(如AOF重写)执行期间, 记录所有新的数据变更
-             * 这些变更会在主操作完成后被合并到主数据集中, 确保数据的一致性和完整性
-             */
+        if (need_incr)
             line_copy = line; // 复制一份用于增量缓冲
-        }
-        // 主命令处理
         int64_t my_seq = 0;
         {
             std::lock_guard<std::mutex> lg(mtx_);
             pending_bytes_ += line.size();
-            my_seq == ++seq_gen_;
+            my_seq = ++seq_gen_;
             queue_.push_back(AofItem{std::move(line), my_seq});
         }
-        if(need_incr) {
+        if (need_incr)
+        {
             std::lock_guard<std::mutex> lk(incr_mtx_);
             incr_cmds_.emplace_back(std::move(line_copy));
         }
         cv_.notify_one();
-        if(opts_.mode == AofMode::kAlways) {
-            // 如果是always模式, 每次写入都同步磁盘, 需要等待命令被持久化
+        if (opts_.mode == AofMode::kAlways)
+        {
             std::unique_lock<std::mutex> lk(mtx_);
-            cv_commit_.wait(lk, [&](){
-                last_synced_seq_ >= my_seq || stop_.load();
-            });
+            cv_commit_.wait(lk, [&]
+                            { return last_synced_seq_ >= my_seq || stop_.load(); });
         }
         return true;
     }

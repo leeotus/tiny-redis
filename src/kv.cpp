@@ -1,4 +1,4 @@
-#include "kv.hpp"
+#include "tiny_redis/kv.hpp"
 #include <memory>
 #include <algorithm>
 #include <mutex>
@@ -184,6 +184,7 @@ namespace tiny_redis
             }
             out.emplace_back(std::move(flat));
         }
+        return out;
     }
 
     std::vector<std::string> KeyValueStore::listKeys() const

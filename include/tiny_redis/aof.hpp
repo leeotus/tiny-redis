@@ -10,7 +10,7 @@
 #include <condition_variable>
 #include <deque>
 #include <chrono>
-#include "config.hpp"
+#include "tiny_redis/config.hpp"
 
 namespace tiny_redis {
 

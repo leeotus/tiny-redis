@@ -33,10 +33,6 @@ public:
     Skiplist();
     ~Skiplist();
 
-    // 不允许浅拷贝, 如果有需求应该重写拷贝函数做深拷贝
-    Skiplist(const Skiplist &) = delete;
-    Skiplist &operator=(const Skiplist &) = delete;
-
     /**
      * @brief 插入节点到跳表中
      * @param score 节点的分数

@@ -1,5 +1,5 @@
-#include "config_loader.hpp"
-#include "config.hpp"
+#include "tiny_redis/config_loader.hpp"
+#include "tiny_redis/config.hpp"
 
 #include <cctype>
 #include <fstream>
