@@ -1,167 +1,259 @@
 #include "tiny_redis/server.hpp"
+
 #include "tiny_redis/resp.hpp"
 #include "tiny_redis/kv.hpp"
+#include "tiny_redis/config.hpp"
+#include "tiny_redis/log.hpp"
 #include "tiny_redis/aof.hpp"
 #include "tiny_redis/rdb.hpp"
-#include "tiny_redis/config.hpp"
 #include "tiny_redis/replica_client.hpp"
-#include "tiny_redis/log.hpp"
 
 #include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <sys/timerfd.h>
+#include <netinet/tcp.h>
 #include <sys/uio.h>
 #include <unistd.h>
-#include <fcntl.h>
 
-#include <string>
 #include <cstring>
 #include <cctype>
 #include <iostream>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
-#include <netinet/tcp.h>
+#include <filesystem>
 
 namespace tiny_redis
 {
 
-    namespace { // 相当于static
-        /**
-         * @brief 设置文件描述符为非阻塞模式
-         * @param fd 需要设置非阻塞模式的文件描述符
-         * @return int 成功返回0, 失败返回-1
-         */
-        int set_nonblocking(int fd) {
+    // ServerConfig moved to config.hpp
+
+    namespace
+    {
+
+        int set_nonblocking(int fd)
+        {
             int flags = fcntl(fd, F_GETFL, 0);
-            if(flags < 0) {
+            if (flags < 0)
                 return -1;
-            }
-            if(fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
                 return -1;
-            }
             return 0;
         }
 
-        /**
-         * @brief 将客户端的文件描述符加入到epoll中
-         * @param epfd epoll的文件描述符
-         * @param fd 客户端连接的文件描述符
-         * @param events 客户端文件描述的事件状态
-         */
-        int add_epoll(int epfd, int fd, uint32_t events) {
+        int add_epoll(int epfd, int fd, uint32_t events)
+        {
             epoll_event ev{};
             ev.events = events;
             ev.data.fd = fd;
             return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
         }
 
-        // @brief 修改客户端文件描述符的events事件
-        int mod_epoll(int epfd, int fd, uint32_t events) {
+        int mod_epoll(int epfd, int fd, uint32_t events)
+        {
             epoll_event ev{};
             ev.events = events;
             ev.data.fd = fd;
             return epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
         }
 
-        struct Conn {
+        struct Conn
+        {
             int fd = -1;
             std::string in = "";
             std::vector<std::string> out_chunks = {}; // 待发送块队列
-            size_t out_iov_idx = 0;                   // 当前发送到第几块
+            size_t out_iov_idx = 0;                   // 当前发送到第几个块
             size_t out_offset = 0;                    // 当前块内偏移
             RespParser parser = {};
-            bool is_replica = false; // 是否是从节点
+            bool is_replica = false;
         };
 
     } // namespace
+
+    Server::Server(const ServerConfig &config) : config_(config) {}
+    Server::~Server()
+    {
+        if (listen_fd_ >= 0)
+            close(listen_fd_);
+        if (epoll_fd_ >= 0)
+            close(epoll_fd_);
+    }
+
+    int Server::setupListen()
+    {
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0)
+        {
+            std::perror("socket");
+            return -1;
+        }
+
+        int yes = 1;
+        setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(config_.port));
+        if (inet_pton(AF_INET, config_.bind_address.c_str(), &addr.sin_addr) != 1)
+        {
+            MR_LOG("ERROR", "Invalid bind address: " << config_.bind_address);
+            return -1;
+        }
+
+        if (bind(listen_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
+        {
+            std::perror("bind");
+            return -1;
+        }
+        if (set_nonblocking(listen_fd_) < 0)
+        {
+            std::perror("fcntl");
+            return -1;
+        }
+        if (listen(listen_fd_, 512) < 0)
+        {
+            std::perror("listen");
+            return -1;
+        }
+        return 0;
+    }
+
+    int Server::setupEpoll()
+    {
+        epoll_fd_ = epoll_create1(0);
+        if (epoll_fd_ < 0)
+        {
+            std::perror("epoll_create1");
+            return -1;
+        }
+        if (add_epoll(epoll_fd_, listen_fd_, EPOLLIN | EPOLLET) < 0)
+        {
+            std::perror("epoll_ctl add");
+            return -1;
+        }
+        // setup periodic timer for active expire scan
+        timer_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        if (timer_fd_ < 0)
+        {
+            std::perror("timerfd_create");
+            return -1;
+        }
+        itimerspec its{};
+        its.it_interval.tv_sec = 0;
+        its.it_interval.tv_nsec = 200 * 1000 * 1000; // 200ms
+        its.it_value = its.it_interval;
+        if (timerfd_settime(timer_fd_, 0, &its, nullptr) < 0)
+        {
+            std::perror("timerfd_settime");
+            return -1;
+        }
+        if (add_epoll(epoll_fd_, timer_fd_, EPOLLIN | EPOLLET) < 0)
+        {
+            std::perror("epoll_ctl add timer");
+            return -1;
+        }
+        return 0;
+    }
 
     KeyValueStore g_store;
     static AofLogger g_aof;
     static Rdb g_rdb;
     static std::vector<std::vector<std::string>> g_repl_queue;
-
-    static inline bool has_pending(const Conn &c) {
+    static inline bool has_pending(const Conn &c)
+    {
         return c.out_iov_idx < c.out_chunks.size() || (c.out_iov_idx == c.out_chunks.size() && c.out_offset != 0);
     }
 
-    static void try_flush_now(int fd, Conn &c, uint32_t &ev) {
-        while(has_pending(c)) {
+    // Try to flush pending output immediately without waiting for EPOLLOUT.
+    static void try_flush_now(int fd, Conn &c, uint32_t &ev)
+    {
+        while (has_pending(c))
+        {
             const size_t max_iov = 64;
             struct iovec iov[max_iov];
             int iovcnt = 0;
-            size_t idx = c.out_iov_idx;     // 当前发送到第几块
-            size_t off = c.out_offset;      // 当前块内的偏移量
-            while(idx < c.out_chunks.size() && iovcnt < static_cast<int>(max_iov)) {
-                const std::string &s = c.out_chunks[idx];  // 要发送的数据
+            size_t idx = c.out_iov_idx;
+            size_t off = c.out_offset;
+            while (idx < c.out_chunks.size() && iovcnt < (int)max_iov)
+            {
+                const std::string &s = c.out_chunks[idx];
                 const char *base = s.data();
                 size_t len = s.size();
-                if(off >= len) {
-                    // 偏移量超出当前块的大小
-                    ++idx;      // 移动到下一块
+                if (off >= len)
+                {
+                    ++idx;
                     off = 0;
                     continue;
                 }
-                iov[iovcnt].iov_base = (void*)(base+off);  // or:
-                // iov[iovcnt].iov_base = reinterpret_cast<void*>(const_cast<char*>(base+off));
+                iov[iovcnt].iov_base = (void *)(base + off);
                 iov[iovcnt].iov_len = len - off;
                 ++iovcnt;
                 ++idx;
                 off = 0;
             }
-            if(iovcnt == 0) {
+            if (iovcnt == 0)
                 break;
-            }
             ssize_t w = ::writev(fd, iov, iovcnt);
-            if(w > 0) {
-                size_t rem = static_cast<size_t>(w);
-                while(rem > 0 && c.out_iov_idx < c.out_chunks.size()) {
+            if (w > 0)
+            {
+                size_t rem = (size_t)w;
+                while (rem > 0 && c.out_iov_idx < c.out_chunks.size())
+                {
                     std::string &s = c.out_chunks[c.out_iov_idx];
                     size_t avail = s.size() - c.out_offset;
-                    if(rem < avail) {
+                    if (rem < avail)
+                    {
                         c.out_offset += rem;
                         rem = 0;
-                    } else {
+                    }
+                    else
+                    {
                         rem -= avail;
                         c.out_offset = 0;
                         ++c.out_iov_idx;
                     }
                 }
-                if(c.out_iov_idx >= c.out_chunks.size()) {
+                if (c.out_iov_idx >= c.out_chunks.size())
+                {
                     c.out_chunks.clear();
                     c.out_iov_idx = 0;
                     c.out_offset = 0;
                 }
-            } else if(w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            }
+            else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            {
+                // need EPOLLOUT to continue later
                 break;
-            } else {
-                std::perror("writev error");
+            }
+            else
+            {
+                std::perror("writev");
                 ev |= EPOLLRDHUP;
                 break;
             }
         }
     }
 
-    static inline void enqueue_out(Conn &c, std::string s) {
-        if(!s.empty()) {
+    static inline void enqueue_out(Conn &c, std::string s)
+    {
+        if (!s.empty())
             c.out_chunks.emplace_back(std::move(s));
-        }
     }
 
-    // 复制积压缓冲区
     static std::string g_repl_backlog;
     static const size_t kReplBacklogCap = 4 * 1024 * 1024; // 4MB
     static int64_t g_repl_offset = 0;                      // total bytes produced
-    static int64_t g_backlog_start_offset = 0;             // 记录缓冲区最早的数据在全局数据流中的位置
+    static int64_t g_backlog_start_offset = 0;             // offset of first byte in backlog buffer
 
     static void appendToBacklog(const std::string &data)
     {
         if (g_repl_backlog.size() + data.size() <= kReplBacklogCap)
         {
-            // 缓冲区没爆, 直接追加进去即可
             g_repl_backlog.append(data);
         }
         else
@@ -169,23 +261,19 @@ namespace tiny_redis
             size_t need = data.size();
             if (need >= kReplBacklogCap)
             {
-                // 新数据太大了, 比缓冲区还大...
                 g_repl_backlog.assign(data.data() + (need - kReplBacklogCap), kReplBacklogCap);
-                // 只保留数据的最后kReplBacklogCap个字节
             }
             else
             {
-                // 需要丢弃前面的缓冲区数据
                 size_t drop = (g_repl_backlog.size() + need) - kReplBacklogCap;
                 g_repl_backlog.erase(0, drop);
                 g_repl_backlog.append(data);
             }
         }
-        // 更新缓冲区的起始偏移量
+        // update start offset after appending
         g_backlog_start_offset = g_repl_offset - static_cast<int64_t>(g_repl_backlog.size());
     }
 
-    // @brief 处理传到主节点服务器的各种命令
     static std::string handle_command(const RespValue &v, const std::string *raw)
     {
         if (v.type != RespType::kArray || v.array.empty())
@@ -201,14 +289,13 @@ namespace tiny_redis
         if (cmd == "PING")
         {
             if (v.array.size() <= 1)
-                return respSimpleString("PONG"); // PING PONG回应
+                return respSimpleString("PONG");
             if (v.array.size() == 2 && v.array[1].type == RespType::kBulkString)
                 return respBulk(v.array[1].bulk);
             return respError("ERR wrong number of arguments for 'PING'");
         }
         if (cmd == "ECHO")
         {
-            // 回声
             if (v.array.size() == 2 && v.array[1].type == RespType::kBulkString)
                 return respBulk(v.array[1].bulk);
             return respError("ERR wrong number of arguments for 'ECHO'");
@@ -755,118 +842,16 @@ namespace tiny_redis
         return respError("ERR unknown command");
     }
 
-    Server::Server(const ServerConfig &config) : config_(config) {}
-
-    Server::~Server()
-    {
-        if (listen_fd_ >= 0)
-        {
-            close(listen_fd_);
-        }
-        if (epoll_fd_ >= 0)
-        {
-            close(epoll_fd_);
-        }
-    }
-
-    int Server::setupListen() {
-        listen_fd_ = ::socket(PF_INET, SOCK_STREAM, 0);
-        if(listen_fd_ < 0) {
-            // 创建主节点服务器文件描述符失败
-            std::perror("socket created failed!");
-            return -1;
-        }
-
-        int on = 1;
-        setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-
-        // 绑定套接字地址
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(static_cast<uint16_t>(config_.port));
-        if(inet_pton(AF_INET, config_.bind_address.c_str(), &addr.sin_addr) != 1) {
-            MR_LOG("ERROR", "Invalid bind address: " << config_.bind_address);
-            return -1;
-        }
-
-        if(bind(listen_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-            std::perror("bind error");
-            return -1;
-        }
-
-        // 设置成非阻塞模式:
-        if(set_nonblocking(listen_fd_) < 0) {
-            std::perror("fcntl");
-            return -1;
-        }
-
-        // 开启监听
-        if(listen(listen_fd_, 512) < 0) {
-            std::perror("listen");
-            return -1;
-        }
-
-        return 0;
-    }
-
-    int Server::setupEpoll()
-    {
-        epoll_fd_ = epoll_create1(0);
-        if(epoll_fd_ < 0) {
-            // epoll创建失败
-            std::perror("epoll_create1");
-            return -1;
-        }
-
-        // 将服务器的文件描述符添加到epoll中
-        if(add_epoll(epoll_fd_, listen_fd_, EPOLLIN | EPOLLET) < 0) {
-            std::perror("epoll_ctl add");
-            return -1;
-        }
-
-        // 定时器文件描述符
-        // @note CLOCK_MONOTONIC 单调时钟, 不受系统时间改变的影响
-        timer_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-        if (timer_fd_ < 0)
-        {
-            std::perror("timerfd_create");
-            return -1;
-        }
-
-        itimerspec its{};
-        /**
-         * 设定定时器的间隔和初始到期时间
-         * it_interval -> 定时器间隔
-         * it_value -> 初始到期时间
-         */
-        its.it_interval.tv_sec = 0;
-        its.it_interval.tv_nsec = 200 * 1000 * 1000;    // 200ms
-        its.it_value = its.it_interval;
-
-        // 启动定时器
-        if(timerfd_settime(timer_fd_, 0, &its, nullptr) < 0) {
-            std::perror("timerfd_settime");
-            return -1;
-        }
-
-        // 添加到epoll监听
-        if(add_epoll(epoll_fd_, timer_fd_, EPOLLIN|EPOLLET) < 0) {
-            std::perror("epoll_ctl add timer");
-            return -1;
-        }
-        return 0;
-    }
-
     int Server::loop()
     {
-        std::unordered_map<int, Conn> conns; // 哈希表记录连接
+        std::unordered_map<int, Conn> conns;
         std::vector<epoll_event> events(128);
         while (true)
         {
             int n = epoll_wait(epoll_fd_, events.data(), static_cast<int>(events.size()), -1);
             if (n < 0)
             {
-                if (errno == EINTR) // 信号中断
+                if (errno == EINTR)
                     continue;
                 std::perror("epoll_wait");
                 return -1;
@@ -877,7 +862,6 @@ namespace tiny_redis
                 uint32_t ev = events[i].events;
                 if (fd == listen_fd_)
                 {
-                    // 有新客户端连接请求!!!
                     while (true)
                     {
                         sockaddr_in cli{};
@@ -901,11 +885,9 @@ namespace tiny_redis
 
                 if (fd == timer_fd_)
                 {
-                    // 定时器
                     while (true)
                     {
                         uint64_t ticks;
-                        // 需要读取定时器的8bytes数据才可以让它继续运行
                         ssize_t _r = ::read(timer_fd_, &ticks, sizeof(ticks));
                         if (_r < 0)
                         {
@@ -921,7 +903,6 @@ namespace tiny_redis
                     continue;
                 }
 
-                // 其他请求, 来客户端的
                 auto it = conns.find(fd);
                 if (it == conns.end())
                     continue;
@@ -983,7 +964,6 @@ namespace tiny_redis
                                     cmd.push_back(static_cast<char>(::toupper(ch)));
                                 if (cmd == "PSYNC")
                                 {
-                                    // 增量同步
                                     // PSYNC <offset>
                                     if (v.array.size() == 2 && v.array[1].type == RespType::kBulkString)
                                     {
@@ -996,7 +976,7 @@ namespace tiny_redis
                                         {
                                             want = -1;
                                         }
-                                        // 使用增量同步的情况:
+                                        // hit backlog?
                                         if (want >= g_backlog_start_offset && want <= g_repl_offset)
                                         {
                                             size_t start = static_cast<size_t>(want - g_backlog_start_offset);
@@ -1009,11 +989,8 @@ namespace tiny_redis
                                                 continue;
                                             }
                                         }
-                                        // FIXME: fallback to full resync using SYNC path below
-                                        else {
-                                            cmd = "SYNC";
-                                        }
                                     }
+                                    // fallback to full resync using SYNC path below
                                 }
                                 if (cmd == "SYNC")
                                 {
@@ -1185,22 +1162,26 @@ namespace tiny_redis
         }
     }
 
-
-    int Server::run() {
-        if(setupListen() < 0) {
+    int Server::run()
+    {
+        if (setupListen() < 0)
             return -1;
-        }
-        if(setupEpoll() < 0) {
+        if (setupEpoll() < 0)
             return -1;
-        }
-        if(config_.rdb.enabled) {
+        // init RDB then AOF and load
+        if (config_.rdb.enabled)
+        {
             g_rdb.setOptions(config_.rdb);
+            // FIXME: 从节点不开启aof, 会导致无法创建从节点数据存放的文件夹而出错
+            std::filesystem::create_directories(config_.rdb.dir);   // 先直接在这里创建目录
             std::string err;
-            if(!g_rdb.load(g_store, err)) {
+            if (!g_rdb.load(g_store, err))
+            {
                 MR_LOG("ERROR", "RDB load failed: " << err);
                 return -1;
             }
         }
+        // init AOF and load
         if (config_.aof.enabled)
         {
             std::string err;
@@ -1214,13 +1195,14 @@ namespace tiny_redis
                 MR_LOG("ERROR", "AOF load failed: " << err);
                 return -1;
             }
-            MR_LOG("INFO", "listening on " << config_.bind_address << ":" << config_.port);
-            // start replica client if configured
-            ReplicaClient repl(config_);
-            repl.start();
-            int rc = loop();
-            repl.stop();
-            return rc;
         }
+        MR_LOG("INFO", "listening on " << config_.bind_address << ":" << config_.port);
+        // start replica client if configured
+        ReplicaClient repl(config_);
+        repl.start();
+        int rc = loop();
+        repl.stop();
+        return rc;
     }
+
 } // namespace tiny_redis

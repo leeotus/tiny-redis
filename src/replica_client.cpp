@@ -8,6 +8,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <netinet/in.h>
+#include <iostream>
+#include <cstring>
+
+using tiny_redis::g_store;
 
 namespace tiny_redis {
 
@@ -85,7 +89,13 @@ namespace tiny_redis {
                     std::string path = r.path();
                     FILE *f = ::fopen(path.c_str(), "wb");
                     if (!f)
+                    {
+                        int err = errno; // 保存 errno 的值，因为后续的函数调用可能会修改它
+                        std::cerr << "Error: Failed to open RDB file at path: '" << path << "'. "
+                                  << "Reason: " << strerror(err) << " (errno=" << err << ")" << std::endl;
+
                         return;
+                    }
                     fwrite(v->bulk.data(), 1, v->bulk.size(), f);
                     fclose(f);
                     std::string err;
